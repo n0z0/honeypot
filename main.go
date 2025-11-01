@@ -1,135 +1,108 @@
-//go:build windows
-
 package main
 
 import (
-	"bufio"
 	"flag"
-	"io"
 	"log"
-	"os"
 	"strings"
 	"time"
+
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
 )
 
 var (
-	logPath = flag.String("path", `C:\Windows\System32\LogFiles\Firewall\pfirewall.log`, "pfirewall.log path")
-	poll    = flag.Duration("poll", 200*time.Millisecond, "poll interval")
+	iface   = flag.String("iface", "", "Npcap interface name (kosongkan untuk auto-pick)")
+	snaplen = flag.Int("snaplen", 96, "SnapLen bytes per packet")
+	promisc = flag.Bool("promisc", true, "Promiscuous mode")
+	timeout = flag.Duration("timeout", pcap.BlockForever, "pcap timeout (BlockForever disarankan)")
+	// Filter: TCP SYN (tanpa ACK) untuk ip & ip6
+	// Catatan: tcp[13] & 0x02 != 0  => SYN bit set
+	//          tcp[13] & 0x10 == 0  => ACK bit tidak set
+	bpf = flag.String("bpf", "(ip or ip6) and tcp and (tcp[13] & 0x02 != 0) and (tcp[13] & 0x10 == 0)", "BPF filter")
 )
-
-var fields map[string]int // nama kolom -> index
 
 func main() {
 	flag.Parse()
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("[*] SYN tail start file=%q", *logPath)
 
-	var off int64
-	for {
-		added, lines, err := readNew(*logPath, &off)
-		if err != nil {
-			log.Printf("[ERR] read: %v", err)
-			time.Sleep(*poll)
-			continue
+	dev := *iface
+	if dev == "" {
+		// Auto-pick interface pertama yang up & punya alamat
+		devs, err := pcap.FindAllDevs()
+		if err != nil || len(devs) == 0 {
+			log.Fatalf("Tidak menemukan interface Npcap: %v", err)
 		}
-		if added == 0 {
-			time.Sleep(*poll)
-			continue
+		for _, d := range devs {
+			if len(d.Addresses) > 0 {
+				dev = d.Name
+				break
+			}
 		}
-		for _, ln := range lines {
-			if ln == "" {
-				continue
-			}
-			// Header & metadata
-			if strings.HasPrefix(ln, "#") {
-				if strings.HasPrefix(ln, "#Fields:") {
-					parseHeader(ln)
-					log.Printf("[INFO] fields parsed")
-				}
-				continue
-			}
-			if fields == nil {
-				continue // belum ada header
-			}
-
-			col := strings.Fields(ln)
-			if up(get(col, "protocol")) != "TCP" {
-				continue
-			}
-			// SYN jika tcpsyn=1 ATAU tcpflags memuat 'S'
-			isSYN := get(col, "tcpsyn") == "1" || strings.Contains(up(get(col, "tcpflags")), "S")
-			if !isSYN {
-				continue
-			}
-			// Ambil info penting
-			action := up(get(col, "action")) // ALLOW/DROP/BLOCK
-			srcIP := get(col, "src-ip")
-			srcPt := get(col, "src-port")
-			dstIP := get(col, "dst-ip")
-			dstPt := get(col, "dst-port")
-
-			log.Printf("[SYN] %s %s:%s -> %s:%s", action, srcIP, srcPt, dstIP, dstPt)
+		if dev == "" {
+			log.Fatalf("Tidak ada interface yang valid, gunakan -iface untuk memilih.")
 		}
 	}
-}
 
-func readNew(path string, off *int64) (int64, []string, error) {
-	f, err := os.Open(path)
+	handle, err := pcap.OpenLive(dev, int32(*snaplen), *promisc, *timeout)
 	if err != nil {
-		return 0, nil, err
+		log.Fatalf("OpenLive gagal di %s: %v", dev, err)
 	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return 0, nil, err
-	}
-	size := st.Size()
-	// rotasi/mengecil: reset ke awal
-	if size < *off {
-		*off = 0
-	}
-	if size == *off {
-		return 0, nil, nil
-	}
-	if _, err := f.Seek(*off, io.SeekStart); err != nil {
-		return 0, nil, err
-	}
-	var lines []string
-	r := bufio.NewReader(f)
-	for {
-		s, err := r.ReadString('\n')
-		if s != "" {
-			lines = append(lines, strings.TrimRight(s, "\r\n"))
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return 0, nil, err
-		}
-	}
-	pos, _ := f.Seek(0, io.SeekCurrent)
-	added := pos - *off
-	*off = pos
-	return added, lines, nil
-}
+	defer handle.Close()
 
-func parseHeader(h string) {
-	fs := strings.Fields(strings.TrimPrefix(h, "#Fields:"))
-	fields = make(map[string]int, len(fs))
-	for i, name := range fs {
-		fields[strings.ToLower(strings.TrimSpace(name))] = i
+	if err := handle.SetBPFFilter(*bpf); err != nil {
+		log.Fatalf("SetBPFFilter gagal: %v", err)
+	}
+	log.Printf("[*] Sniffing on: %s", dev)
+	log.Printf("[*] BPF: %s", *bpf)
+
+	src := gopacket.NewPacketSource(handle, handle.LinkType())
+	for pkt := range src.Packets() {
+		printSYN(pkt)
 	}
 }
 
-func get(cols []string, name string) string {
-	if fields == nil {
-		return ""
-	}
-	if i, ok := fields[strings.ToLower(name)]; ok && i >= 0 && i < len(cols) {
-		return cols[i]
-	}
-	return ""
-}
+func printSYN(pkt gopacket.Packet) {
+	net := pkt.NetworkLayer()
+	tr := pkt.TransportLayer()
 
-func up(s string) string { return strings.ToUpper(s) }
+	if net == nil || tr == nil {
+		return
+	}
+	tcp, _ := tr.(*layers.TCP)
+	if tcp == nil {
+		return
+	}
+
+	// Extra guard (selain BPF) kalau-kalau filter diubah
+	if !(tcp.SYN && !tcp.ACK) {
+		return
+	}
+
+	srcIP := net.NetworkFlow().Src().String()
+	dstIP := net.NetworkFlow().Dst().String()
+	// ringkas info flags
+	flags := []string{}
+	if tcp.SYN {
+		flags = append(flags, "SYN")
+	}
+	if tcp.ACK {
+		flags = append(flags, "ACK")
+	}
+	if tcp.RST {
+		flags = append(flags, "RST")
+	}
+	if tcp.FIN {
+		flags = append(flags, "FIN")
+	}
+	if tcp.PSH {
+		flags = append(flags, "PSH")
+	}
+	if tcp.URG {
+		flags = append(flags, "URG")
+	}
+
+	log.Printf("[SYN] %s:%d -> %s:%d flags=%s win=%d ts=%s",
+		srcIP, tcp.SrcPort, dstIP, tcp.DstPort, strings.Join(flags, "|"),
+		tcp.Window, time.Now().Format(time.RFC3339Nano))
+}
